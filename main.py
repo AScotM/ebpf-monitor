@@ -1,1553 +1,849 @@
-#!/usr/bin/env python3
-"""
-eBPF Process Monitor for Fedora 44
-Requires: bcc, bcc-tools, python3-bcc, kernel-devel, kernel-headers
-"""
 
+import argparse
+import ctypes
+import json
 import os
+import platform
+import signal
 import sys
 import time
-import ctypes
-import signal
-import logging
-import platform
 from collections import Counter, deque
-from collections.abc import Callable
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
-try:
-    from bcc import BPF
-except ImportError as exc:
-    print(f"ERROR: BCC not installed: {exc}")
-    print("Install with: sudo dnf install bcc bcc-tools python3-bcc")
-    sys.exit(1)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+DEFAULT_PATTERNS = (
+    "aircrack-ng",
+    "ettercap",
+    "hashcat",
+    "hydra",
+    "john",
+    "masscan",
+    "msfconsole",
+    "nc",
+    "netcat",
+    "nikto",
+    "nmap",
+    "reaver",
+    "sqlmap",
+    "tcpdump",
+    "tshark",
+    "wireshark",
+    "wpscan",
 )
 
-logger = logging.getLogger(__name__)
+
+class ExecEventStruct(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("tid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16),
+        ("filename", ctypes.c_char * 256),
+    ]
+
+
+class OpenEventStruct(ctypes.Structure):
+    _fields_ = [
+        ("timestamp_ns", ctypes.c_uint64),
+        ("pid", ctypes.c_uint32),
+        ("tid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("flags", ctypes.c_int32),
+        ("comm", ctypes.c_char * 16),
+        ("filename", ctypes.c_char * 256),
+    ]
 
 
 @dataclass(slots=True)
 class Event:
+    timestamp: str
+    kind: str
     pid: int
+    tid: int
     uid: int
     comm: str
     filename: str
-    ppid: Optional[int] = None
-    timestamp: float = field(default_factory=time.time)
+    ppid: int | None = None
+    flags: int | None = None
+    alert: str | None = None
 
 
-@dataclass(slots=True)
-class OpenEvent:
-    pid: int
-    comm: str
-    filename: str
-    flags: int
-    timestamp: float = field(default_factory=time.time)
+class Output:
+    def __init__(self, mode, output_file=None):
+        self.mode = mode
+        self.handle = None
 
-
-@dataclass(slots=True)
-class Alert:
-    pid: int
-    comm: str
-    filename: str
-    reason: str
-    timestamp: float = field(default_factory=time.time)
-
-
-class SystemChecker:
-    @staticmethod
-    def check_root() -> bool:
-        if os.geteuid() != 0:
-            logger.error("eBPF requires root privileges")
-            logger.info("Run with: sudo python3 %s", sys.argv[0])
-            return False
-        return True
-
-    @staticmethod
-    def check_bcc() -> bool:
-        try:
-            import bcc
-
-            version = getattr(bcc, "__version__", "unknown")
-            logger.info("BCC version: %s", version)
-            return True
-        except ImportError:
-            logger.error("BCC not installed")
-            logger.info(
-                "Install: sudo dnf install bcc bcc-tools python3-bcc"
+        if output_file:
+            self.handle = open(
+                output_file,
+                "a",
+                encoding="utf-8",
+                buffering=1,
             )
-            return False
+
+    def write(self, payload):
+        if self.mode == "json":
+            line = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        else:
+            line = self.format_text(payload)
+
+        print(line, flush=True)
+
+        if self.handle:
+            self.handle.write(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                ) + "\n"
+            )
 
     @staticmethod
-    def check_kernel_headers() -> bool:
+    def format_text(payload):
+        kind = payload.get("kind", "unknown")
+        timestamp = payload.get("timestamp", "")
+        pid = payload.get("pid", 0)
+        tid = payload.get("tid", 0)
+        uid = payload.get("uid", 0)
+        comm = payload.get("comm", "")
+        filename = payload.get("filename", "")
+
+        parts = [
+            f"[{timestamp}]",
+            f"{kind.upper():8}",
+            f"PID={pid:<7}",
+            f"TID={tid:<7}",
+            f"UID={uid:<6}",
+            f"COMM={comm:<16}",
+        ]
+
+        if payload.get("ppid") is not None:
+            parts.append(f"PPID={payload['ppid']}")
+
+        if payload.get("flags") is not None:
+            parts.append(f"FLAGS={payload['flags']:#x}")
+
+        parts.append(f"FILE={filename}")
+
+        if payload.get("alert"):
+            parts.append(f"ALERT={payload['alert']}")
+
+        return " ".join(parts)
+
+    def close(self):
+        if self.handle:
+            self.handle.close()
+            self.handle = None
+
+
+class Statistics:
+    def __init__(self, history_size):
+        self.started = time.monotonic()
+        self.exec_events = 0
+        self.open_events = 0
+        self.alerts = 0
+        self.lost_events = 0
+        self.history = deque(maxlen=history_size)
+        self.process_counts = Counter()
+        self.alert_counts = Counter()
+
+    def record(self, event):
+        if event.kind == "exec":
+            self.exec_events += 1
+        elif event.kind == "open":
+            self.open_events += 1
+
+        if event.alert:
+            self.alerts += 1
+            self.alert_counts[event.alert] += 1
+
+        self.process_counts[event.comm] += 1
+        self.history.append(event)
+
+    def report(self):
+        return {
+            "kind": "statistics",
+            "timestamp": utc_now(),
+            "uptime_seconds": round(
+                time.monotonic() - self.started,
+                2,
+            ),
+            "exec_events": self.exec_events,
+            "open_events": self.open_events,
+            "alerts": self.alerts,
+            "lost_events": self.lost_events,
+            "retained_events": len(self.history),
+            "top_processes": self.process_counts.most_common(10),
+            "alert_patterns": self.alert_counts.most_common(10),
+        }
+
+
+class Environment:
+    @staticmethod
+    def inspect():
         kernel = platform.release()
 
-        header_paths = (
-            f"/usr/src/kernels/{kernel}",
-            f"/lib/modules/{kernel}/build",
-        )
+        checks = {
+            "platform": platform.system(),
+            "kernel": kernel,
+            "root": os.geteuid() == 0,
+            "bcc": False,
+            "bcc_error": None,
+            "tracefs": False,
+            "tracefs_path": None,
+            "kernel_devel": False,
+            "kernel_devel_path": None,
+            "bpf_filesystem": Path("/sys/fs/bpf").is_dir(),
+        }
 
-        for path in header_paths:
-            include_path = os.path.join(path, "include")
+        try:
+            from bcc import BPF
+            checks["bcc"] = True
+            checks["bcc_class"] = BPF.__name__
+        except Exception as exc:
+            checks["bcc_error"] = str(exc)
 
-            if os.path.exists(path) and os.path.exists(include_path):
-                logger.info("Kernel headers found at: %s", path)
-                return True
-
-        logger.error("Kernel headers not found")
-        logger.info(
-            "Install: sudo dnf install kernel-devel kernel-headers"
-        )
-        logger.info(
-            "For exact version: sudo dnf install kernel-devel-%s",
-            kernel,
-        )
-
-        return False
-
-    @staticmethod
-    def check_tracing_filesystem() -> bool:
         for path in (
             "/sys/kernel/tracing",
             "/sys/kernel/debug/tracing",
         ):
-            if os.path.isdir(path):
-                logger.info(
-                    "Tracing filesystem available at: %s",
-                    path,
-                )
-                return True
+            if (
+                Path(path).is_dir()
+                and Path(path, "events").is_dir()
+            ):
+                checks["tracefs"] = True
+                checks["tracefs_path"] = path
+                break
 
-        logger.error("Tracing filesystem not available")
-        logger.info(
-            "Mount with: "
-            "sudo mount -t tracefs tracefs /sys/kernel/tracing"
-        )
+        for path in (
+            f"/usr/src/kernels/{kernel}",
+            f"/lib/modules/{kernel}/build",
+        ):
+            if Path(path, "include").is_dir():
+                checks["kernel_devel"] = True
+                checks["kernel_devel_path"] = path
+                break
 
-        return False
+        return checks
 
     @staticmethod
-    def check_security_settings() -> None:
-        checks = {
-            "kernel.kptr_restrict": (
-                "/proc/sys/kernel/kptr_restrict",
-                "Kernel pointer visibility is restricted",
-            ),
-            "net.core.bpf_jit_harden": (
-                "/proc/sys/net/core/bpf_jit_harden",
-                "BPF JIT hardening is enabled",
-            ),
-            "kernel.yama.ptrace_scope": (
-                "/proc/sys/kernel/yama/ptrace_scope",
-                "Process tracing restrictions are enabled",
-            ),
-        }
+    def print_report(mode):
+        result = Environment.inspect()
 
-        for name, (path, warning) in checks.items():
-            try:
-                with open(
-                    path,
-                    "r",
-                    encoding="utf-8",
-                ) as handle:
-                    value = int(handle.read().strip())
+        if mode == "json":
+            print(json.dumps(result, indent=2))
+        else:
+            print("eBPF Monitor Environment")
+            print("-" * 48)
 
-                if value > 0:
-                    logger.info(
-                        "%s=%d - %s",
-                        name,
-                        value,
-                        warning,
-                    )
+            for key, value in result.items():
+                print(f"{key:22}: {value}")
 
-            except FileNotFoundError:
-                continue
+            print()
+            print("Required for tracing: root and BCC")
+            print("Kernel development files may be needed")
+            print("depending on the BCC and kernel configuration.")
 
-            except (
-                OSError,
-                ValueError,
-            ) as exc:
-                logger.debug(
-                    "Could not read %s: %s",
-                    name,
-                    exc,
-                )
-
-    @classmethod
-    def check_all(cls) -> bool:
-        logger.info(
-            "=== System Environment Check ==="
-        )
-
-        checks = (
-            (
-                cls.check_root,
-                "Root privileges",
-            ),
-            (
-                cls.check_bcc,
-                "BCC installation",
-            ),
-            (
-                cls.check_kernel_headers,
-                "Kernel headers",
-            ),
-            (
-                cls.check_tracing_filesystem,
-                "Tracing filesystem",
-            ),
-        )
-
-        all_passed = True
-
-        for check_func, name in checks:
-            if check_func():
-                logger.info(
-                    "PASSED: %s",
-                    name,
-                )
-            else:
-                logger.error(
-                    "FAILED: %s",
-                    name,
-                )
-                all_passed = False
-
-        if all_passed:
-            cls.check_security_settings()
-
-        return all_passed
+        return result
 
 
 class BPFPrograms:
-    MINIMAL = r"""
-    int hello(void *ctx)
-    {
-        bpf_trace_printk("Hello from eBPF\n");
+    HEADER = r"""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+struct exec_event_t {
+    u64 timestamp_ns;
+    u32 pid;
+    u32 tid;
+    u32 uid;
+    u32 ppid;
+    char comm[TASK_COMM_LEN];
+    char filename[256];
+};
+
+struct open_event_t {
+    u64 timestamp_ns;
+    u32 pid;
+    u32 tid;
+    u32 uid;
+    s32 flags;
+    char comm[TASK_COMM_LEN];
+    char filename[256];
+};
+
+BPF_PERF_OUTPUT(exec_events);
+BPF_PERF_OUTPUT(open_events);
+"""
+
+    EXEC = r"""
+TRACEPOINT_PROBE(syscalls, sys_enter_execve)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    u32 tid = (u32)id;
+
+    if (TARGET_PID != 0 && pid != TARGET_PID) {
         return 0;
     }
-    """
 
-    EXECVE_MONITOR = r"""
-    #include <uapi/linux/ptrace.h>
-    #include <linux/sched.h>
+    struct exec_event_t event = {};
 
-    struct event_t {
-        u32 pid;
-        u32 uid;
-        char comm[TASK_COMM_LEN];
-        char filename[256];
-    };
+    event.timestamp_ns = bpf_ktime_get_ns();
+    event.pid = pid;
+    event.tid = tid;
+    event.uid = (u32)bpf_get_current_uid_gid();
 
-    BPF_PERF_OUTPUT(events);
+    struct task_struct *task =
+        (struct task_struct *)bpf_get_current_task();
 
-    TRACEPOINT_PROBE(syscalls, sys_enter_execve)
-    {
-        struct event_t event = {};
+    event.ppid = 0;
 
-        event.pid = bpf_get_current_pid_tgid() >> 32;
-        event.uid = bpf_get_current_uid_gid();
+    bpf_probe_read_kernel(
+        &event.ppid,
+        sizeof(event.ppid),
+        &task->real_parent->tgid
+    );
 
-        bpf_get_current_comm(
-            &event.comm,
-            sizeof(event.comm)
-        );
+    bpf_get_current_comm(
+        &event.comm,
+        sizeof(event.comm)
+    );
 
-        bpf_probe_read_user_str(
-            &event.filename,
-            sizeof(event.filename),
-            (void *)args->filename
-        );
+    bpf_probe_read_user_str(
+        &event.filename,
+        sizeof(event.filename),
+        (void *)args->filename
+    );
 
-        events.perf_submit(
-            args,
-            &event,
-            sizeof(event)
-        );
+    exec_events.perf_submit(
+        args,
+        &event,
+        sizeof(event)
+    );
 
+    return 0;
+}
+"""
+
+    OPEN = r"""
+TRACEPOINT_PROBE(syscalls, sys_enter_openat)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    u32 pid = id >> 32;
+    u32 tid = (u32)id;
+
+    if (TARGET_PID != 0 && pid != TARGET_PID) {
         return 0;
     }
-    """
 
-    OPENAT_MONITOR = r"""
-    #include <uapi/linux/ptrace.h>
-    #include <linux/sched.h>
+    struct open_event_t event = {};
 
-    struct open_event_t {
-        u32 pid;
-        char comm[TASK_COMM_LEN];
-        char filename[256];
-        int flags;
-    };
+    event.timestamp_ns = bpf_ktime_get_ns();
+    event.pid = pid;
+    event.tid = tid;
+    event.uid = (u32)bpf_get_current_uid_gid();
+    event.flags = args->flags;
 
-    BPF_PERF_OUTPUT(open_events);
+    bpf_get_current_comm(
+        &event.comm,
+        sizeof(event.comm)
+    );
 
-    TRACEPOINT_PROBE(syscalls, sys_enter_openat)
-    {
-        struct open_event_t event = {};
+    bpf_probe_read_user_str(
+        &event.filename,
+        sizeof(event.filename),
+        (void *)args->filename
+    );
 
-        event.pid = bpf_get_current_pid_tgid() >> 32;
-        event.flags = args->flags;
+    open_events.perf_submit(
+        args,
+        &event,
+        sizeof(event)
+    );
 
-        bpf_get_current_comm(
-            &event.comm,
-            sizeof(event.comm)
-        );
+    return 0;
+}
+"""
 
-        bpf_probe_read_user_str(
-            &event.filename,
-            sizeof(event.filename),
-            (void *)args->filename
-        );
+    @classmethod
+    def build(cls, monitor_exec, monitor_open, pid):
+        program = cls.HEADER
 
-        open_events.perf_submit(
-            args,
-            &event,
-            sizeof(event)
-        );
+        if monitor_exec:
+            program += cls.EXEC
 
-        return 0;
-    }
-    """
+        if monitor_open:
+            program += cls.OPEN
 
-    @staticmethod
-    def execve_with_pid_filter(
-        pid: int,
-    ) -> str:
-        return rf"""
-        #include <uapi/linux/ptrace.h>
-        #include <linux/sched.h>
-
-        struct event_t {{
-            u32 pid;
-            u32 uid;
-            char comm[TASK_COMM_LEN];
-            char filename[256];
-        }};
-
-        BPF_PERF_OUTPUT(events);
-
-        TRACEPOINT_PROBE(
-            syscalls,
-            sys_enter_execve
+        return program.replace(
+            "TARGET_PID",
+            str(pid or 0),
         )
-        {{
-            u32 pid =
-                bpf_get_current_pid_tgid() >> 32;
-
-            if (pid != {pid}) {{
-                return 0;
-            }}
-
-            struct event_t event = {{}};
-
-            event.pid = pid;
-            event.uid =
-                bpf_get_current_uid_gid();
-
-            bpf_get_current_comm(
-                &event.comm,
-                sizeof(event.comm)
-            );
-
-            bpf_probe_read_user_str(
-                &event.filename,
-                sizeof(event.filename),
-                (void *)args->filename
-            );
-
-            events.perf_submit(
-                args,
-                &event,
-                sizeof(event)
-            );
-
-            return 0;
-        }}
-        """
 
 
-class ProcessMonitor:
-    MAX_EVENTS = 10_000
-    MAX_OPEN_EVENTS = 10_000
-    MAX_ALERTS = 2_000
-
-    def __init__(self) -> None:
-        self.bpf: Optional[BPF] = None
+class Monitor:
+    def __init__(self, args):
+        self.args = args
         self.running = False
-
-        self.events: deque[Event] = deque(
-            maxlen=self.MAX_EVENTS
+        self.bpf = None
+        self.output = Output(
+            args.format,
+            args.output,
         )
+        self.stats = Statistics(args.history)
+        self.patterns = self.load_patterns()
+        self.start_wall_ns = time.time_ns()
+        self.start_monotonic_ns = time.monotonic_ns()
+        self.last_report = time.monotonic()
 
-        self.open_events: deque[OpenEvent] = deque(
-            maxlen=self.MAX_OPEN_EVENTS
-        )
+    def load_patterns(self):
+        patterns = set()
 
-        self.alerts: deque[Alert] = deque(
-            maxlen=self.MAX_ALERTS
-        )
+        if self.args.command == "security":
+            patterns.update(DEFAULT_PATTERNS)
 
-        self.event_callbacks: list[
-            Callable[[Event], None]
-        ] = []
+        for item in self.args.pattern:
+            value = item.strip().casefold()
 
-        self.open_callbacks: list[
-            Callable[[OpenEvent], None]
-        ] = []
+            if value:
+                patterns.add(value)
 
-        self.alert_callbacks: list[
-            Callable[[Alert], None]
-        ] = []
-
-        self.total_events = 0
-        self.total_open_events = 0
-        self.total_alerts = 0
-
-        self.lost_events = 0
-        self.lost_open_events = 0
-
-        signal.signal(
-            signal.SIGTERM,
-            self._signal_handler,
-        )
-
-    def _signal_handler(
-        self,
-        signum,
-        frame,
-    ) -> None:
-        logger.info(
-            "Received signal %d",
-            signum,
-        )
-
-        self.stop()
-
-    @contextmanager
-    def _bpf_context(
-        self,
-        program: str,
-    ):
-        bpf = None
-
-        try:
-            bpf = BPF(
-                text=program
-            )
-
-            self.bpf = bpf
-
-            yield bpf
-
-        except Exception as exc:
-            logger.error(
-                "BPF setup failed: %s",
-                exc,
-            )
-
-            raise
-
-        finally:
-            self.running = False
-            self.bpf = None
-
-            if bpf is not None:
-                try:
-                    bpf.cleanup()
-                except Exception:
-                    pass
-
-    @staticmethod
-    def _decode_c_string(
-        value: bytes,
-    ) -> str:
-        return (
-            value
-            .split(
-                b"\0",
-                1,
-            )[0]
-            .decode(
-                "utf-8",
-                errors="replace",
-            )
-        )
-
-    @staticmethod
-    def _resolve_ppid(
-        pid: int,
-    ) -> Optional[int]:
-        try:
+        if self.args.pattern_file:
             with open(
-                f"/proc/{pid}/status",
+                self.args.pattern_file,
                 "r",
                 encoding="utf-8",
             ) as handle:
                 for line in handle:
-                    if line.startswith(
-                        "PPid:"
-                    ):
-                        return int(
-                            line
-                            .split(
-                                ":",
-                                1,
-                            )[1]
-                            .strip()
-                        )
+                    value = line.strip().casefold()
 
-        except (
-            FileNotFoundError,
-            ProcessLookupError,
-            PermissionError,
-            ValueError,
-            OSError,
-        ):
-            return None
+                    if value:
+                        patterns.add(value)
 
-        return None
+        return patterns
+
+    def timestamp_from_kernel(self, kernel_ns):
+        wall_ns = (
+            self.start_wall_ns
+            + kernel_ns
+            - self.start_monotonic_ns
+        )
+
+        return datetime.fromtimestamp(
+            wall_ns / 1_000_000_000,
+            timezone.utc,
+        ).isoformat(timespec="milliseconds")
 
     @staticmethod
-    def _safe_callback(
-        callback: Callable,
-        payload,
-        callback_type: str,
-    ) -> None:
-        try:
-            callback(
-                payload
-            )
-
-        except Exception:
-            logger.exception(
-                "%s callback failed",
-                callback_type,
-            )
-
-    def _handle_lost_exec_events(
-        self,
-        cpu: int,
-        count: int,
-    ) -> None:
-        self.lost_events += count
-
-        logger.warning(
-            "Lost %d exec event(s) on CPU %d",
-            count,
-            cpu,
+    def decode(value):
+        return bytes(value).split(
+            b"\0",
+            1,
+        )[0].decode(
+            "utf-8",
+            errors="replace",
         )
 
-    def _handle_lost_open_events(
-        self,
-        cpu: int,
-        count: int,
-    ) -> None:
-        self.lost_open_events += count
-
-        logger.warning(
-            "Lost %d open event(s) on CPU %d",
-            count,
-            cpu,
-        )
-
-    def run_minimal(
-        self,
-    ) -> bool:
-        try:
-            with self._bpf_context(
-                BPFPrograms.MINIMAL
-            ) as bpf:
-                candidates = (
-                    "__x64_sys_getpid",
-                    "__ia32_sys_getpid",
-                    "sys_getpid",
-                )
-
-                attached = False
-
-                for event in candidates:
-                    try:
-                        bpf.attach_kprobe(
-                            event=event,
-                            fn_name="hello",
-                        )
-
-                        logger.info(
-                            "Attached to kprobe: %s",
-                            event,
-                        )
-
-                        attached = True
-                        break
-
-                    except Exception:
-                        continue
-
-                if not attached:
-                    logger.error(
-                        "Failed to attach minimal "
-                        "test kprobe"
-                    )
-
-                    return False
-
-                logger.info(
-                    "Minimal BPF program loaded"
-                )
-
-                logger.info(
-                    "Use getpid from another shell "
-                    "to generate events"
-                )
-
-                logger.info(
-                    "Trace output: "
-                    "/sys/kernel/tracing/trace_pipe"
-                )
-
-                logger.info(
-                    "Press Ctrl+C to stop"
-                )
-
-                self.running = True
-
-                while self.running:
-                    try:
-                        time.sleep(
-                            1
-                        )
-
-                    except KeyboardInterrupt:
-                        self.stop()
-
-                return True
-
-        except Exception as exc:
-            logger.error(
-                "Minimal test failed: %s",
-                exc,
-            )
-
-            return False
-
-    def _run_exec_monitor(
-        self,
-        program: str,
-        event_handler: Callable[
-            [Event],
-            None,
-        ],
-        label: str,
-    ) -> bool:
-        class EventStruct(
-            ctypes.Structure
-        ):
-            _fields_ = [
-                (
-                    "pid",
-                    ctypes.c_uint32,
-                ),
-                (
-                    "uid",
-                    ctypes.c_uint32,
-                ),
-                (
-                    "comm",
-                    ctypes.c_char * 16,
-                ),
-                (
-                    "filename",
-                    ctypes.c_char * 256,
-                ),
-            ]
-
-        try:
-            with self._bpf_context(
-                program
-            ) as bpf:
-
-                def handle_event(
-                    cpu,
-                    data,
-                    size,
-                ) -> None:
-                    raw = ctypes.cast(
-                        data,
-                        ctypes.POINTER(
-                            EventStruct
-                        ),
-                    ).contents
-
-                    event = Event(
-                        pid=int(
-                            raw.pid
-                        ),
-                        uid=int(
-                            raw.uid
-                        ),
-                        comm=self._decode_c_string(
-                            bytes(
-                                raw.comm
-                            )
-                        ),
-                        filename=self._decode_c_string(
-                            bytes(
-                                raw.filename
-                            )
-                        ),
-                        ppid=self._resolve_ppid(
-                            int(
-                                raw.pid
-                            )
-                        ),
-                    )
-
-                    event_handler(
-                        event
-                    )
-
-                bpf[
-                    "events"
-                ].open_perf_buffer(
-                    handle_event,
-                    lost_cb=(
-                        self
-                        ._handle_lost_exec_events
-                    ),
-                )
-
-                logger.info(
-                    "%s",
-                    label,
-                )
-
-                logger.info(
-                    "Press Ctrl+C to stop"
-                )
-
-                self.running = True
-
-                while self.running:
-                    try:
-                        bpf.perf_buffer_poll(
-                            timeout=100
-                        )
-
-                    except KeyboardInterrupt:
-                        self.stop()
-
-                return True
-
-        except Exception as exc:
-            logger.error(
-                "%s failed: %s",
-                label,
-                exc,
-            )
-
-            return False
-
-    def _record_exec_event(
-        self,
-        event: Event,
-    ) -> None:
-        self.events.append(
-            event
-        )
-
-        self.total_events += 1
-
-        for callback in self.event_callbacks:
-            self._safe_callback(
-                callback,
-                event,
-                "Event",
-            )
-
-        ppid = (
-            str(
-                event.ppid
-            )
-            if event.ppid is not None
-            else "?"
-        )
-
-        timestamp = (
-            datetime
-            .fromtimestamp(
-                event.timestamp
-            )
-            .strftime(
-                "%H:%M:%S"
-            )
-        )
-
-        print(
-            f"[{timestamp}] "
-            f"PID: {event.pid:6d} "
-            f"PPID: {ppid:>6s} "
-            f"UID: {event.uid:5d} "
-            f"COMM: {event.comm[:15]:15s} "
-            f"FILE: {event.filename}"
-        )
-
-    def monitor_execve(
-        self,
-    ) -> bool:
-        return self._run_exec_monitor(
-            BPFPrograms.EXECVE_MONITOR,
-            self._record_exec_event,
-            "Monitoring process executions",
-        )
-
-    def monitor_with_pid_filter(
-        self,
-        target_pid: int,
-    ) -> bool:
-        if target_pid <= 0:
-            logger.error(
-                "PID must be greater than zero"
-            )
-
-            return False
-
-        if not os.path.exists(
-            f"/proc/{target_pid}"
-        ):
-            logger.warning(
-                "PID %d does not currently exist",
-                target_pid,
-            )
-
-        return self._run_exec_monitor(
-            BPFPrograms.execve_with_pid_filter(
-                target_pid
-            ),
-            self._record_exec_event,
-            (
-                "Monitoring execve calls "
-                f"for PID {target_pid}"
-            ),
-        )
-
-    def monitor_opens(
-        self,
-    ) -> bool:
-        class OpenEventStruct(
-            ctypes.Structure
-        ):
-            _fields_ = [
-                (
-                    "pid",
-                    ctypes.c_uint32,
-                ),
-                (
-                    "comm",
-                    ctypes.c_char * 16,
-                ),
-                (
-                    "filename",
-                    ctypes.c_char * 256,
-                ),
-                (
-                    "flags",
-                    ctypes.c_int,
-                ),
-            ]
-
-        try:
-            with self._bpf_context(
-                BPFPrograms.OPENAT_MONITOR
-            ) as bpf:
-
-                def handle_open(
-                    cpu,
-                    data,
-                    size,
-                ) -> None:
-                    raw = ctypes.cast(
-                        data,
-                        ctypes.POINTER(
-                            OpenEventStruct
-                        ),
-                    ).contents
-
-                    event = OpenEvent(
-                        pid=int(
-                            raw.pid
-                        ),
-                        comm=self._decode_c_string(
-                            bytes(
-                                raw.comm
-                            )
-                        ),
-                        filename=self._decode_c_string(
-                            bytes(
-                                raw.filename
-                            )
-                        ),
-                        flags=int(
-                            raw.flags
-                        ),
-                    )
-
-                    self.open_events.append(
-                        event
-                    )
-
-                    self.total_open_events += 1
-
-                    for callback in self.open_callbacks:
-                        self._safe_callback(
-                            callback,
-                            event,
-                            "Open",
-                        )
-
-                    timestamp = (
-                        datetime
-                        .fromtimestamp(
-                            event.timestamp
-                        )
-                        .strftime(
-                            "%H:%M:%S"
-                        )
-                    )
-
-                    print(
-                        f"[{timestamp}] "
-                        f"PID: {event.pid:6d} "
-                        f"COMM: "
-                        f"{event.comm[:15]:15s} "
-                        f"FLAGS: "
-                        f"{event.flags:#x} "
-                        f"FILE: "
-                        f"{event.filename}"
-                    )
-
-                bpf[
-                    "open_events"
-                ].open_perf_buffer(
-                    handle_open,
-                    lost_cb=(
-                        self
-                        ._handle_lost_open_events
-                    ),
-                )
-
-                logger.info(
-                    "Monitoring openat "
-                    "file operations"
-                )
-
-                logger.info(
-                    "Press Ctrl+C to stop"
-                )
-
-                self.running = True
-
-                while self.running:
-                    try:
-                        bpf.perf_buffer_poll(
-                            timeout=100
-                        )
-
-                    except KeyboardInterrupt:
-                        self.stop()
-
-                return True
-
-        except Exception as exc:
-            logger.error(
-                "File-open monitor failed: %s",
-                exc,
-            )
-
-            return False
-
-    def register_event_callback(
-        self,
-        callback: Callable[
-            [Event],
-            None,
-        ],
-    ) -> None:
-        self.event_callbacks.append(
-            callback
-        )
-
-    def register_open_callback(
-        self,
-        callback: Callable[
-            [OpenEvent],
-            None,
-        ],
-    ) -> None:
-        self.open_callbacks.append(
-            callback
-        )
-
-    def register_alert_callback(
-        self,
-        callback: Callable[
-            [Alert],
-            None,
-        ],
-    ) -> None:
-        self.alert_callbacks.append(
-            callback
-        )
-
-    def stop(
-        self,
-    ) -> None:
-        if self.running:
-            logger.info(
-                "Stopping monitor"
-            )
-
-        self.running = False
-
-
-class SecurityMonitor(
-    ProcessMonitor
-):
-    def __init__(
-        self,
-    ) -> None:
-        super().__init__()
-
-        self.suspicious_patterns = (
-            "nc",
-            "nmap",
-            "masscan",
-            "hydra",
-            "metasploit",
-            "msfconsole",
-            "john",
-            "hashcat",
-            "netcat",
-            "scan",
-            "exploit",
-            "burp",
-            "sqlmap",
-            "nikto",
-            "wpscan",
-            "aircrack",
-            "reaver",
-            "ettercap",
-            "wireshark",
-            "tcpdump",
-        )
-
-    def _find_suspicious_pattern(
-        self,
-        event: Event,
-    ) -> Optional[str]:
-        comm = event.comm.casefold()
-        filename = event.filename.casefold()
-
-        basename = os.path.basename(
-            filename
-        )
-
-        for pattern in self.suspicious_patterns:
-            needle = pattern.casefold()
-
-            if (
-                needle in comm
-                or needle in basename
-            ):
-                return pattern
+    def detect_alert(self, filename):
+        basename = os.path.basename(filename).casefold()
+
+        if basename in self.patterns:
+            return f"executable:{basename}"
 
         return None
 
-    def _handle_security_event(
-        self,
-        event: Event,
-    ) -> None:
-        self.events.append(
-            event
-        )
+    def emit_event(self, event):
+        self.stats.record(event)
+        self.output.write(asdict(event))
 
-        self.total_events += 1
-
-        for callback in self.event_callbacks:
-            self._safe_callback(
-                callback,
-                event,
-                "Event",
-            )
-
-        matched_pattern = (
-            self
-            ._find_suspicious_pattern(
-                event
-            )
-        )
-
-        if matched_pattern is None:
+    def handle_exec(self, cpu, data, size):
+        if size < ctypes.sizeof(ExecEventStruct):
             return
 
-        alert = Alert(
-            pid=event.pid,
-            comm=event.comm,
-            filename=event.filename,
-            reason=(
-                "Suspicious pattern: "
-                f"{matched_pattern}"
+        raw = ctypes.cast(
+            data,
+            ctypes.POINTER(ExecEventStruct),
+        ).contents
+
+        filename = self.decode(raw.filename)
+
+        event = Event(
+            timestamp=self.timestamp_from_kernel(
+                raw.timestamp_ns
             ),
+            kind="exec",
+            pid=int(raw.pid),
+            tid=int(raw.tid),
+            uid=int(raw.uid),
+            ppid=int(raw.ppid),
+            comm=self.decode(raw.comm),
+            filename=filename,
+            alert=self.detect_alert(filename),
         )
 
-        self.alerts.append(
-            alert
-        )
-
-        self.total_alerts += 1
-
-        for callback in self.alert_callbacks:
-            self._safe_callback(
-                callback,
-                alert,
-                "Alert",
-            )
-
-        timestamp = (
-            datetime
-            .fromtimestamp(
-                alert.timestamp
-            )
-            .strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        )
-
-        print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            f"[ALERT #{self.total_alerts}] "
-            f"{timestamp}"
-        )
-
-        print(
-            f"Process: {alert.comm} "
-            f"(PID: {alert.pid})"
-        )
-
-        print(
-            f"Reason:  {alert.reason}"
-        )
-
-        print(
-            f"File:    {alert.filename}"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print()
-
-    def monitor_suspicious(
-        self,
-    ) -> bool:
-        return self._run_exec_monitor(
-            BPFPrograms.EXECVE_MONITOR,
-            self._handle_security_event,
-            "Security monitor active",
-        )
-
-    def print_report(
-        self,
-    ) -> None:
-        print()
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "SECURITY REPORT"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "Exec events captured: "
-            f"{self.total_events}"
-        )
-
-        print(
-            "Open events captured: "
-            f"{self.total_open_events}"
-        )
-
-        print(
-            "Alerts triggered: "
-            f"{self.total_alerts}"
-        )
-
-        print(
-            "Lost exec events: "
-            f"{self.lost_events}"
-        )
-
-        print(
-            "Lost open events: "
-            f"{self.lost_open_events}"
-        )
-
-        print(
-            "Exec events retained: "
-            f"{len(self.events)}"
-        )
-
-        print(
-            "Open events retained: "
-            f"{len(self.open_events)}"
-        )
-
-        print(
-            "Alerts retained: "
-            f"{len(self.alerts)}"
-        )
-
-        if not self.alerts:
-            print(
-                "No retained security alerts"
-            )
-
-            print(
-                "=" * 70
-            )
-
+        if (
+            self.args.command == "security"
+            and not event.alert
+            and not self.args.show_all
+        ):
+            self.stats.record(event)
             return
 
-        process_counts = Counter(
-            alert.comm
-            for alert in self.alerts
+        self.emit_event(event)
+
+    def handle_open(self, cpu, data, size):
+        if size < ctypes.sizeof(OpenEventStruct):
+            return
+
+        raw = ctypes.cast(
+            data,
+            ctypes.POINTER(OpenEventStruct),
+        ).contents
+
+        event = Event(
+            timestamp=self.timestamp_from_kernel(
+                raw.timestamp_ns
+            ),
+            kind="open",
+            pid=int(raw.pid),
+            tid=int(raw.tid),
+            uid=int(raw.uid),
+            comm=self.decode(raw.comm),
+            filename=self.decode(raw.filename),
+            flags=int(raw.flags),
         )
+
+        self.emit_event(event)
+
+    def handle_lost(self, cpu, count):
+        self.stats.lost_events += count
+
+        self.output.write({
+            "kind": "lost",
+            "timestamp": utc_now(),
+            "cpu": cpu,
+            "count": count,
+        })
+
+    def stop(self, signum=None, frame=None):
+        self.running = False
+
+    def print_statistics(self):
+        report = self.stats.report()
+
+        if self.args.format == "json":
+            self.output.write(report)
+            return
 
         print()
+        print("eBPF Monitor Statistics")
+        print("-" * 48)
+        print(f"Uptime:          {report['uptime_seconds']} s")
+        print(f"Exec events:     {report['exec_events']}")
+        print(f"Open events:     {report['open_events']}")
+        print(f"Alerts:          {report['alerts']}")
+        print(f"Lost events:     {report['lost_events']}")
+        print(f"Retained events: {report['retained_events']}")
 
-        print(
-            "Unique suspicious processes: "
-            f"{len(process_counts)}"
-        )
+        if report["top_processes"]:
+            print()
+            print("Top processes:")
 
-        print(
-            "Unique suspicious files: "
-            f"{len({
-                alert.filename
-                for alert in self.alerts
-            })}"
-        )
+            for name, count in report["top_processes"]:
+                print(f"  {name:20} {count:8}")
 
-        print()
+        if report["alert_patterns"]:
+            print()
+            print("Alert patterns:")
 
-        print(
-            "Top suspicious processes:"
-        )
+            for name, count in report["alert_patterns"]:
+                print(f"  {name:20} {count:8}")
 
-        for comm, count in (
-            process_counts
-            .most_common(
-                10
+    def run(self):
+        if os.geteuid() != 0:
+            raise RuntimeError(
+                "Root privileges are required for BCC tracing"
             )
-        ):
-            print(
-                f"  {comm:15s} "
-                f"{count:6d}"
-            )
-
-        print()
-
-        print(
-            "Recent alerts:"
-        )
-
-        for alert in list(
-            self.alerts
-        )[-10:]:
-            timestamp = (
-                datetime
-                .fromtimestamp(
-                    alert.timestamp
-                )
-                .strftime(
-                    "%H:%M:%S"
-                )
-            )
-
-            print(
-                f"  {timestamp} "
-                f"{alert.comm:15s} "
-                f"PID={alert.pid:<7d} "
-                f"{alert.reason}"
-            )
-
-        print(
-            "=" * 70
-        )
-
-
-def print_statistics(
-    monitor: SecurityMonitor,
-) -> None:
-    print()
-
-    print(
-        "STATISTICS"
-    )
-
-    print(
-        "-" * 70
-    )
-
-    print(
-        "Exec events captured: "
-        f"{monitor.total_events}"
-    )
-
-    print(
-        "Open events captured: "
-        f"{monitor.total_open_events}"
-    )
-
-    print(
-        "Alerts triggered: "
-        f"{monitor.total_alerts}"
-    )
-
-    print(
-        "Lost exec events: "
-        f"{monitor.lost_events}"
-    )
-
-    print(
-        "Lost open events: "
-        f"{monitor.lost_open_events}"
-    )
-
-    print(
-        "Exec events retained: "
-        f"{len(monitor.events)}"
-    )
-
-    print(
-        "Open events retained: "
-        f"{len(monitor.open_events)}"
-    )
-
-    print(
-        "Alerts retained: "
-        f"{len(monitor.alerts)}"
-    )
-
-    if monitor.alerts:
-        counts = Counter(
-            alert.comm
-            for alert in monitor.alerts
-        )
-
-        print()
-
-        print(
-            "Top suspicious processes:"
-        )
-
-        for comm, count in (
-            counts
-            .most_common(
-                5
-            )
-        ):
-            print(
-                f"  {comm:15s}: "
-                f"{count}"
-            )
-
-
-def main() -> None:
-    print(
-        "=" * 70
-    )
-
-    print(
-        "eBPF Process Monitor for Fedora 44"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print()
-
-    if not SystemChecker.check_all():
-        logger.error(
-            "Environment check failed. "
-            "Fix the reported issues "
-            "and try again."
-        )
-
-        sys.exit(
-            1
-        )
-
-    monitor = SecurityMonitor()
-
-    while True:
-        print()
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "MAIN MENU"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "  1. Minimal test"
-        )
-
-        print(
-            "  2. Monitor process executions"
-        )
-
-        print(
-            "  3. Monitor file opens"
-        )
-
-        print(
-            "  4. Monitor specific PID"
-        )
-
-        print(
-            "  5. Security monitor"
-        )
-
-        print(
-            "  6. Show statistics"
-        )
-
-        print(
-            "  7. Show security report"
-        )
-
-        print(
-            "  8. Exit"
-        )
-
-        print(
-            "=" * 70
-        )
 
         try:
-            choice = input(
-                "Select option [1-8]: "
-            ).strip()
+            from bcc import BPF
+        except ImportError as exc:
+            raise RuntimeError(
+                "BCC Python bindings are unavailable. "
+                "Install python3-bcc and bcc."
+            ) from exc
 
-            if choice == "1":
-                monitor.run_minimal()
+        monitor_exec = self.args.command in (
+            "exec",
+            "security",
+            "all",
+        )
 
-            elif choice == "2":
-                monitor.monitor_execve()
+        monitor_open = self.args.command in (
+            "open",
+            "all",
+        )
 
-            elif choice == "3":
-                monitor.monitor_opens()
+        program = BPFPrograms.build(
+            monitor_exec,
+            monitor_open,
+            self.args.pid,
+        )
 
-            elif choice == "4":
-                try:
-                    target_pid = int(
-                        input(
-                            "Enter PID "
-                            "to monitor: "
-                        ).strip()
-                    )
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
 
-                except ValueError:
-                    logger.error(
-                        "Invalid PID"
-                    )
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
 
-                    continue
+        try:
+            self.bpf = BPF(text=program)
 
-                monitor.monitor_with_pid_filter(
-                    target_pid
+            if monitor_exec:
+                self.bpf[
+                    "exec_events"
+                ].open_perf_buffer(
+                    self.handle_exec,
+                    page_cnt=self.args.pages,
+                    lost_cb=self.handle_lost,
                 )
 
-            elif choice == "5":
-                monitor.monitor_suspicious()
-
-            elif choice == "6":
-                print_statistics(
-                    monitor
+            if monitor_open:
+                self.bpf[
+                    "open_events"
+                ].open_perf_buffer(
+                    self.handle_open,
+                    page_cnt=self.args.pages,
+                    lost_cb=self.handle_lost,
                 )
 
-                input(
-                    "Press Enter to continue..."
-                )
+            self.running = True
 
-            elif choice == "7":
-                monitor.print_report()
-
-                input(
-                    "Press Enter to continue..."
-                )
-
-            elif choice == "8":
+            if self.args.format == "text":
                 print(
-                    "Exiting..."
+                    f"eBPF Monitor v2.0 | "
+                    f"Mode: {self.args.command} | "
+                    f"Kernel: {platform.release()}"
                 )
 
-                if monitor.total_alerts:
-                    monitor.print_report()
+                if self.args.pid:
+                    print(f"PID filter: {self.args.pid}")
 
-                return
+                print("Press Ctrl+C to stop.")
+                print()
 
-            else:
-                logger.error(
-                    "Invalid choice. Select 1-8"
+            while self.running:
+                self.bpf.perf_buffer_poll(timeout=200)
+
+                now = time.monotonic()
+
+                if (
+                    self.args.interval > 0
+                    and now - self.last_report
+                    >= self.args.interval
+                ):
+                    self.print_statistics()
+                    self.last_report = now
+
+                if (
+                    self.args.duration > 0
+                    and now - self.stats.started
+                    >= self.args.duration
+                ):
+                    self.running = False
+
+        finally:
+            self.running = False
+
+            try:
+                self.print_statistics()
+            finally:
+                if self.bpf is not None:
+                    self.bpf.cleanup()
+                    self.bpf = None
+
+                self.output.close()
+
+                signal.signal(
+                    signal.SIGINT,
+                    previous_sigint,
                 )
 
-        except KeyboardInterrupt:
-            print()
-            print(
-                "Exiting..."
-            )
-            return
+                signal.signal(
+                    signal.SIGTERM,
+                    previous_sigterm,
+                )
 
-        except EOFError:
-            print()
-            print(
-                "Exiting..."
-            )
-            return
 
-        except Exception:
-            logger.exception(
-                "Unexpected error"
-            )
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    ).isoformat(timespec="milliseconds")
+
+
+def positive_int(value):
+    number = int(value)
+
+    if number < 1:
+        raise argparse.ArgumentTypeError(
+            "Value must be greater than zero"
+        )
+
+    return number
+
+
+def nonnegative_float(value):
+    number = float(value)
+
+    if number < 0:
+        raise argparse.ArgumentTypeError(
+            "Value cannot be negative"
+        )
+
+    return number
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ebpf-monitor",
+        description=(
+            "Linux process and file activity monitor "
+            "using BCC and eBPF"
+        ),
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    subparsers.add_parser(
+        "check",
+        help="Inspect the eBPF environment",
+    )
+
+    for command, description in (
+        ("exec", "Monitor process execution attempts"),
+        ("open", "Monitor openat file operations"),
+        ("all", "Monitor execution and file operations"),
+        ("security", "Monitor selected executable names"),
+    ):
+        sub = subparsers.add_parser(
+            command,
+            help=description,
+        )
+
+        sub.add_argument(
+            "--pid",
+            type=positive_int,
+            default=0,
+            help="Filter events by process ID",
+        )
+
+        sub.add_argument(
+            "--format",
+            choices=("text", "json"),
+            default="text",
+            help="Output format",
+        )
+
+        sub.add_argument(
+            "--output",
+            help="Append JSON Lines events to a file",
+        )
+
+        sub.add_argument(
+            "--duration",
+            type=nonnegative_float,
+            default=0,
+            help="Stop after this many seconds",
+        )
+
+        sub.add_argument(
+            "--interval",
+            type=nonnegative_float,
+            default=0,
+            help="Periodic statistics interval",
+        )
+
+        sub.add_argument(
+            "--history",
+            type=positive_int,
+            default=10000,
+            help="Maximum retained events",
+        )
+
+        sub.add_argument(
+            "--pages",
+            type=positive_int,
+            default=64,
+            help="Perf buffer page count",
+        )
+
+        sub.add_argument(
+            "--pattern",
+            action="append",
+            default=[],
+            help="Exact executable name to flag",
+        )
+
+        sub.add_argument(
+            "--pattern-file",
+            help="File containing executable names",
+        )
+
+        sub.add_argument(
+            "--show-all",
+            action="store_true",
+            help="Show non-alert execution events in security mode",
+        )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "check":
+        Environment.print_report("text")
+        return 0
+
+    monitor = None
+
+    try:
+        monitor = Monitor(args)
+        monitor.run()
+        return 0
+
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(
+            f"Error: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    except KeyboardInterrupt:
+        return 130
+
+    except Exception as exc:
+        print(
+            f"Unexpected error: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    finally:
+        if monitor is not None:
+            monitor.output.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
